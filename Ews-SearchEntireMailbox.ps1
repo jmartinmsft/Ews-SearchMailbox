@@ -25,7 +25,6 @@ param(
     [Parameter(Mandatory = $false)] [string] $Subject,
     [Parameter(Mandatory = $false)] [System.Management.Automation.PSCredential]$Credential,
     [Parameter(Mandatory = $true, HelpMessage="Mailbox to search")] [string] $MailboxName,
-    [Parameter(Mandatory = $false, HelpMessage="Folder to search for items")] [string] $FolderName,
     [Parameter(Mandatory = $false, HelpMessage="Sender to search for in items")] [string] $Sender,
     [Parameter(Mandatory = $false, HelpMessage="The start date for your search criteria. All messages older than this date will be deleted.")] [datetime] $OlderThan,
     [Parameter(Mandatory = $false, HelpMessage="The start date for your search criteria. All messages newer than this date will be deleted.")] [datetime] $LaterThan,
@@ -66,7 +65,7 @@ function Enable-TraceHandler(){
 function Get-OAuthToken{
     #Change the AppId, AppSecret, and TenantId to match your registered application
     $AppId = "6a93c8c4-9cf6-4efe-a8ab-9eb178b8dff4"
-    $AppSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    $AppSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     $TenantId = "9101fc97-5be5-4438-a1d7-83e051e52057"
     #Build the URI for the token request
     $Uri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
@@ -271,6 +270,7 @@ if($EnableLogging) {
     $service.TraceListener = $TraceHandlerObj
 }
 
+if($Archive) {
 $SearchFolderNames = @("ArchiveDeletedItems",
 "ArchiveMsgFolderRoot",
 "ArchiveRecoverableItemsDeletions",
@@ -283,6 +283,15 @@ $SearchFolderNames = @("ArchiveDeletedItems",
 "RecoverableItemsRoot",
 "RecoverableItemsVersions"
 )
+}
+else {
+    $SearchFolderNames = @("MsgFolderRoot",
+"RecoverableItemsDeletions",
+"RecoverableItemsPurges",
+"RecoverableItemsRoot",
+"RecoverableItemsVersions"
+)
+}
 foreach($FolderName in $SearchFolderNames) {
     #Define Extended properties
     $PR_FOLDER_TYPE = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition(13825,[Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Integer);  
