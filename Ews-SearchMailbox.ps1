@@ -38,7 +38,7 @@ param(
     [Parameter(Mandatory = $false, HelpMessage="Mailbox being accessed is an archive mailbox")] [boolean] $Archive=$false
 )
 
-function TraceHandler(){
+function Enable-TraceHandler(){
     $sourceCode = @"
         public class ewsTraceListener : Microsoft.Exchange.WebServices.Data.ITraceListener
         {
@@ -57,7 +57,7 @@ function TraceHandler(){
 function Get-OAuthToken{
     #Change the AppId, AppSecret, and TenantId to match your registered application
     $AppId = "6a93c8c4-9cf6-4efe-a8ab-9eb178b8dff4"
-    $AppSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    $AppSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     $TenantId = "9101fc97-5be5-4438-a1d7-83e051e52057"
     #Build the URI for the token request
     $Uri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
@@ -98,49 +98,6 @@ function Get-DelegatedOAuthToken {
     return $Token.AccessToken
 }
 
-function Find-MailboxItem {    
-    param(
-        [Parameter(Mandatory = $true)] [string] $FolderName,
-        [Parameter(Mandatory = $true)] [string] $MailboxName,
-        [Parameter(Mandatory = $true)] [Microsoft.Exchange.WebServices.Data.ExchangeService]$EwsService,
-        [Parameter(Mandatory = $true)] [string] $OutputFile,
-        [Parameter(Mandatory = $true)] [string] $MeetingSubject
-    )
-    $folderid= new-object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::$FolderName,$MailboxName)   
-    $rootContainer = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($service,$folderid)
-    
-    #Define ItemView to retrive just 1000 Items    
-    $ivItemView =  New-Object Microsoft.Exchange.WebServices.Data.ItemView(1000) 
-    $fiItems = $null      
-    do{   
-        $ItemPropset= New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties)
-        $fiItems = $service.FindItems($rootContainer.Id,$MeetingSubject,$ivItemView)
-        if($fiItems.Items.Count -gt 0){  
-            [Void]$service.LoadPropertiesForItems($fiItems,$ItemPropset)    
-            foreach($Item in $fiItems.Items){   
-                if($Item.Subject -eq $Subject -and ($Item.ItemClass -eq "IPM.Appointment" -or $Item.ItemClass -eq "IPM.Schedule.Meeting.Request" -or $Item.ItemClass -eq "IPM.Schedule.Meeting.Request.Canceled")) {
-                    Write-Host "Deleting item from $MailboxName..." -NoNewline -ForegroundColor Yellow
-                    $CustomObject = New-Object -TypeName psobject
-                    $CustomObject | Add-Member -MemberType NoteProperty -Name "Mailbox" -Value $MailboxName
-                    $CustomObject | Add-Member -MemberType NoteProperty -Name "Folder" -Value $FolderName
-                    $CustomObject | Add-Member -MemberType NoteProperty -Name "Subject" -Value $Item.Subject
-                    $CustomObject | Add-Member -MemberType NoteProperty -Name "DateTimeReceived" -Value $Item.DateTimeReceived
-                    $CustomObject | Add-Member -MemberType NoteProperty -Name "MessageClass" -Value $Item.ItemClass
-                    $CustomObject | Export-Csv $OutputPath\$OutputFile -Append -NoTypeInformation
-                    try {
-                    #$Item.Delete([Microsoft.Exchange.WebServices.Data.DeleteMode]::HardDelete)
-                    Write-Host " SUCCESS" -ForegroundColor Green
-                }
-                    catch {
-                    Write-Host "  FAILED" -ForegroundColor Red
-                }
-                }
-            }
-        }
-        $ivItemView.Offset += $fiItems.Items.Count
-    }
-    while($fiItems.MoreAvailable -eq $true)
-}
 
 #region LoadEwsManagedAPI
 #Check for EWS Managed API, exit if missing
@@ -243,7 +200,7 @@ if($EnableLogging) {
     $TraceHandlerObj = Enable-TraceHandler
     $OutputPath = Get-Location
     $TraceHandlerObj.LogFile = "$OutputPath\$MailboxName-TraceLog.log"
-    $EwsService.TraceListener = $TraceHandlerObj
+    $service.TraceListener = $TraceHandlerObj
 }
 
 #Find-MailboxItem -FolderName $FolderName -MailboxName $MailboxName -EwsService $service -OutputFile $CsvFile -MeetingSubject $Subject
