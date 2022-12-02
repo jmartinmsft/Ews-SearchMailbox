@@ -57,7 +57,7 @@ function TraceHandler(){
 function Get-OAuthToken{
     #Change the AppId, AppSecret, and TenantId to match your registered application
     $AppId = "6a93c8c4-9cf6-4efe-a8ab-9eb178b8dff4"
-    $AppSecret = "3828Q~6sL1vAU~fF6qPJ-WCECduL3fpE4RLqNcZs"
+    $AppSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     $TenantId = "9101fc97-5be5-4438-a1d7-83e051e52057"
     #Build the URI for the token request
     $Uri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
@@ -260,7 +260,7 @@ catch{
     }
 }
 $rootContainer = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($service,$folderid)  
-if($FolderName -notin $WellKnownFolderNames -or $Archive) {
+if($FolderName -notin $WellKnownFolderNames) {
     $fvFolderView = New-Object Microsoft.Exchange.WebServices.Data.FolderView(1)
     $SfSearchFilter = New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName,$FolderName)
     $findFolderResults = $service.FindFolders($rootContainer.Id,$SfSearchFilter,$fvFolderView)
