@@ -22,17 +22,19 @@
     SOFTWARE
 #>
 
-# Version 24.06.13.1004
+# Version 24.06.14.0926
 
 param (
-    #[ValidateSet("Online", "Onprem")]
-    #[Parameter(Mandatory = $false)]
-    #[string]$Environment="Online",
+    [ValidateSet("Online", "Onprem")][Parameter(Mandatory = $false)]
+    [string]$Environment="Online",
 
     [Parameter(Position=0, Mandatory=$True, HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
     [ValidateNotNullOrEmpty()]
     [string]$Mailbox,
 
+    [Parameter(Mandatory=$false, HelpMessage="The PermissionType parameter specifies whether the app registrations uses delegated or application permissions")] [ValidateSet('Application','Delegated')]
+    [string]$PermissionType,
+    
     [Parameter(Mandatory=$False, HelpMessage="The Archive parameter is a switch to search the archive mailbox (otherwise, the main mailbox is searched).")]
     [alias("SearchArchive")] [switch]$Archive,
 
@@ -74,6 +76,9 @@ param (
     [Parameter(Mandatory = $false)]
     [string]$AzureEnvironment = "Global",
 
+    [Parameter(Mandatory=$False, HelpMessage="The EwsUrl parameter specifies the on-premises Exchange Web Services URL.")]
+    [string]$EwsUrl,
+
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 2147483)]
     [int]$TimeoutSeconds = 300,
@@ -83,19 +88,29 @@ param (
     [string]$DLLPath,
 
     [Parameter(Mandatory=$False, HelpMessage="The OAuthClientId parameter is the Azure Application Id that this script uses to obtain the OAuth token.  Must be registered in Azure AD.")]
-    [string]$OAuthClientId = "",
+    [string]$OAuthClientId,
 
     [Parameter(Mandatory=$False, HelpMessage="The OAuthTenantId parameter is the tenant Id where the application is registered (Must be in the same tenant as mailbox being accessed).")]
-    [string]$OAuthTenantId = "",
+    [string]$OAuthTenantId,
 
     [Parameter(Mandatory=$False, HelpMessage="The OAuthRedirectUri parameter is the redirect Uri of the Azure registered application.")]
-    [string]$OAuthRedirectUri = "https://login.microsoftonline.com/common/oauth2/nativeclient",
+    [string]$OAuthRedirectUri = "http://localhost:8004",
 
     [Parameter(Mandatory=$False, HelpMessage="The OAuthSecretKey parameter is the the secret for the registered application.")]
-    [SecureString]$OAuthClientSecret = "",
+    [SecureString]$OAuthClientSecret,
 
     [Parameter(Mandatory=$False, HelpMessage="The OAuthCertificate parameter is the certificate for the registered application. Certificate auth requires MSAL libraries to be available.")]
     $OAuthCertificate = $null,
+
+    [Parameter(Mandatory=$False,HelpMessage="The CertificateStore parameter specifies the certificate store where the certificate is loaded.")] [ValidateSet("CurrentUser", "LocalMachine")]
+     [string] $CertificateStore = $null,
+     
+    [Parameter(Mandatory=$false)] [Array]$Scope= @("EWS.AccessAsUser.All"),
+
+    [Parameter(Mandatory=$false)][switch]$UseImpersonation,
+
+    [Parameter(Mandatory=$false)][pscredential]$credential,
+
     [ValidateScript({ Test-Path $_ })] [Parameter(Mandatory = $true, HelpMessage="The OutputPath parameter specifies the path for the EWS usage report.")] [string] $OutputPath,
 
     [Parameter(Mandatory=$False, HelpMessage="The ThrottlingDelay parameter specifies the throttling delay (time paused between sending EWS requests) - note that this will be increased automatically if throttling is detected")]
@@ -104,9 +119,7 @@ param (
     [Parameter(Mandatory=$False, HelpMessage="The BatchSize parameter specifies the batch size (number of items batched into one EWS request) - this will be decreased if throttling is detected")]
     [int]$BatchSize = 200
 )
-
 begin {
-
 function Write-VerboseLog ($Message) {
     $Script:Logger = $Script:Logger | Write-LoggerInstance $Message
 }
@@ -416,7 +429,6 @@ function Invoke-LoggerInstanceCleanup {
     }
 }
 
-
 function Invoke-CatchActionError {
     [CmdletBinding()]
     param(
@@ -517,6 +529,56 @@ function Test-ADCredentials {
     }
 }
 
+function Show-Disclaimer {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [ValidateNotNullOrEmpty()]
+        [string]$Message,
+        [ValidateNotNullOrEmpty()]
+        [string]$Target,
+        [ValidateNotNullOrEmpty()]
+        [string]$Operation
+    )
+
+    if ($PSCmdlet.ShouldProcess($Message, $Target, $Operation) -or
+        $WhatIfPreference) {
+        return
+    } else {
+        exit
+    }
+}
+
+function EWSAuth {
+    param(
+        [string]$Environment,
+        $Token,
+        $EwsUri
+    )
+    Write-Verbose "Calling $($MyInvocation.MyCommand)"
+    ## Create the Exchange Service object with credentials
+    $Service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2016)
+    $Service.Timeout = $TimeoutSeconds * 1000
+    if ($Environment -eq "Onprem") {
+        if([string]::IsNullOrEmpty($OAuthClientId)){
+            $Service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.WebCredentials($credential.UserName, [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($credential.Password)))
+        }
+        else {
+            $Service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.OAuthCredentials($Token)
+        }
+    }
+    else {
+        $Service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.OAuthCredentials($Token)
+    }
+
+    $Service.Url = $EwsUri
+    $Service.HttpHeaders.Add("X-AnchorMailbox", $Mailbox)
+    if($PermissionType -eq "Application" -or $UseImpersonation) {
+        $Service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $Mailbox)
+    }
+    
+    return $Service
+}
+
 function Get-CloudServiceEndpoint {
     [CmdletBinding()]
     param(
@@ -587,30 +649,15 @@ function Get-CloudServiceEndpoint {
 function Get-NewJsonWebToken {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $true)]
-        [string]$CertificateThumbprint,
-
-        [ValidateSet("CurrentUser", "LocalMachine")]
-        [Parameter(Mandatory = $false)]
-        [string]$CertificateStore = "CurrentUser",
-
-        [Parameter(Mandatory = $false)]
-        [string]$Issuer,
-
-        [Parameter(Mandatory = $false)]
-        [string]$Audience,
-
-        [Parameter(Mandatory = $false)]
-        [string]$Subject,
-
-        [Parameter(Mandatory = $false)]
-        [int]$TokenLifetimeInSeconds = 3600,
-
-        [ValidateSet("RS256", "RS384", "RS512")]
-        [Parameter(Mandatory = $false)]
-        [string]$SigningAlgorithm = "RS256"
+        [Parameter(Mandatory = $true)][string]$CertificateThumbprint,
+        [ValidateSet("CurrentUser", "LocalMachine")][Parameter(Mandatory = $false)][string]$CertificateStore = "CurrentUser",
+        [Parameter(Mandatory = $false)][string]$Issuer,
+        [Parameter(Mandatory = $false)][string]$Audience,
+        [Parameter(Mandatory = $false)][string]$Subject,
+        [Parameter(Mandatory = $false)][int]$TokenLifetimeInSeconds = 3600,
+        [ValidateSet("RS256", "RS384", "RS512")][Parameter(Mandatory = $false)][string]$SigningAlgorithm = "RS256"
     )
-
+    
     <#
         Shared function to create a signed Json Web Token (JWT) by using a certificate.
         It is also possible to use a secret key to sign the token, but that is not supported in this function.
@@ -704,31 +751,18 @@ function Get-NewJsonWebToken {
     }
 }
 
-function Get-NewOAuthToken {
+function Get-ApplicationAccessToken {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $true)]
-        [string]$TenantID,
-
-        [Parameter(Mandatory = $true)]
-        [string]$ClientID,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Secret,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Endpoint,
-
-        [Parameter(Mandatory = $false)]
-        [string]$TokenService = "oauth2/v2.0/token",
-
-        [Parameter(Mandatory = $false)]
-        [switch]$CertificateBasedAuthentication,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Scope
+        [Parameter(Mandatory = $true)][string]$TenantID,
+        [Parameter(Mandatory = $true)][string]$ClientID,
+        [Parameter(Mandatory = $true)][string]$Secret,
+        [Parameter(Mandatory = $true)][string]$Endpoint,
+        [Parameter(Mandatory = $false)][string]$TokenService = "oauth2/v2.0/token",
+        [Parameter(Mandatory = $false)][switch]$CertificateBasedAuthentication,
+        [Parameter(Mandatory = $true)][string]$Scope
     )
-
+    
     <#
         Shared function to create an OAuth token by using a JWT or secret.
         If you want to use a certificate, set the CertificateBasedAuthentication switch and pass a JWT token as the Secret parameter.
@@ -737,7 +771,6 @@ function Get-NewOAuthToken {
         This function returns a PSCustomObject with the OAuth token, status and the time the token was created.
         If the request fails, the PSCustomObject will contain the exception message.
     #>
-
     begin {
         Write-Verbose "Calling $($MyInvocation.MyCommand)"
         $oAuthTokenCallSuccess = $false
@@ -787,213 +820,515 @@ function Get-NewOAuthToken {
     }
 }
 
-function Show-Disclaimer {
-    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+function CheckTokenExpiry {
     param(
-        [ValidateNotNullOrEmpty()]
-        [string]$Message,
-        [ValidateNotNullOrEmpty()]
-        [string]$Target,
-        [ValidateNotNullOrEmpty()]
-        [string]$Operation
-    )
-
-    if ($PSCmdlet.ShouldProcess($Message, $Target, $Operation) -or
-        $WhatIfPreference) {
-        return
-    } else {
-        exit
-    }
-}
-
-    function EWSAuth {
-        param(
-            [string]$Environment,
-            $Token,
-            $EWSOnlineURL,
-            $EWSServerURL
-        )
-        ## Create the Exchange Service object with credentials
-        $Service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2016)
-
-        $Service.Timeout = $TimeoutSeconds * 1000
-
-        if ($Environment -eq "Onprem") {
-            $Service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.WebCredentials($credential.UserName, [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($credential.Password)))
-        } else {
-            $Service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.OAuthCredentials($Token.access_token)
-        }
-
-        if ($Environment -eq "Onprem") {
-            if (-not([System.String]::IsNullOrEmpty($EWSServerURL))) {
-                $Service.Url = New-Object Uri($EWSServerURL)
-                CheckOnpremCredentials -EWSService $Service
-            } else {
-                try {
-                    $credentialTestResult = Test-ADCredentials -Credentials $credential
-                    if ($credentialTestResult.CredentialsValid) {
-                        Write-Host "Credentials validated successfully." -ForegroundColor Green
-                    } elseif ($credentialTestResult.CredentialsValid -eq $false) {
-                        Write-Host "Credentials that were provided are incorrect." -ForegroundColor Red
-                        exit
-                    } else {
-                        Write-Host "Credentials couldn't be validated. Trying to use the credentials anyway." -ForegroundColor Yellow
-                    }
-
-                    if (($credentialTestResult.UsernameFormat -eq "downlevel") -or
-                    ($credentialTestResult.UsernameFormat -eq "local")) {
-                        Write-Host "Username: $($Credential.UserName) was passed in $($credentialTestResult.UsernameFormat) format" -ForegroundColor Red
-                        Write-Host "You must use the -EWSServerURL parameter if the username is not in UPN (username@domain) format." -ForegroundColor Red
-                        exit
-                    }
-
-                    $redirectionCallback = {
-                        param([string]$url)
-                        return $url.ToLower().StartsWith($autoDSecureName)
-                    }
-
-                    $Service.AutodiscoverUrl($Credential.UserName, $redirectionCallback)
-                } catch [Microsoft.Exchange.WebServices.Data.AutodiscoverLocalException] {
-                    Write-Host "Unable to locate the Autodiscover service by using username $($Credential.UserName)" -ForegroundColor Red
-                    Write-Host "A reason could be that the username that was passed uses a domain which is not an accepted domain by Exchange Server." -ForegroundColor Red
-                    Write-Host "You must use the -EWSServerURL parameter if the Autodiscover service cannot be located." -ForegroundColor Red
-                    Write-Host "Inner Exception:`n$_" -ForegroundColor Red
-                    exit
-                } catch [System.FormatException] {
-                    # We should no longer get here as we are validating the username format above, however, keeping this as failsafe for now
-                    Write-Host "Username: $($Credential.UserName) was passed in an unexpected format" -ForegroundColor Red
-                    Write-Host "Please try again or use the -EWSServerURL parameter to provide the EWS url." -ForegroundColor Red
-                    Write-Host "Inner Exception:`n$_" -ForegroundColor Red
-                    exit
-                } catch {
-                    Write-Host "Unable to make Autodiscover call to fetch EWS endpoint details. Please make sure you have enter valid credentials. Inner Exception`n`n$_" -ForegroundColor Red
-                    exit
-                }
-            }
-        } else {
-            $Service.Url = $Script:ewsOnlineURL
-        }
-        $Service.HttpHeaders.Add("X-AnchorMailbox", $Mailbox)
-        $Service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $Mailbox)
-        return $Service
-    }
-
-    function CheckTokenExpiry {
-        param(
             $ApplicationInfo,
             [ref]$EWSService,
             [ref]$Token,
             [string]$Environment,
             $EWSOnlineURL,
-            $EWSOnlineScope,
+            $AuthScope,
             $AzureADEndpoint
         )
+        Write-Verbose "Calling $($MyInvocation.MyCommand)"
+    # if token is going to expire in next 5 min then refresh it
+    if ($null -eq $script:tokenLastRefreshTime -or $script:tokenLastRefreshTime.AddMinutes(55) -lt (Get-Date)) {
+        Write-Verbose "Requesting new OAuth token as the current token expires at $($script:tokenLastRefreshTime)."
+        if($PermissionType -eq "Application") {
+        $createOAuthTokenParams = @{
+            TenantID                       = $ApplicationInfo.TenantID
+            ClientID                       = $ApplicationInfo.ClientID
+            Endpoint                       = $AzureADEndpoint
+            CertificateBasedAuthentication = (-not([System.String]::IsNullOrEmpty($ApplicationInfo.CertificateThumbprint)))
+            Scope                           = $Script:TokenScope
+        }
 
-        # if token is going to expire in next 5 min then refresh it
-        if ($null -eq $script:tokenLastRefreshTime -or $script:tokenLastRefreshTime.AddMinutes(55) -lt (Get-Date)) {
-            $createOAuthTokenParams = @{
-                TenantID                       = $ApplicationInfo.TenantID
-                ClientID                       = $ApplicationInfo.ClientID
-                Endpoint                       = $AzureADEndpoint
-                CertificateBasedAuthentication = (-not([System.String]::IsNullOrEmpty($ApplicationInfo.CertificateThumbprint)))
-                Scope                          = $EWSOnlineScope
+        # Check if we use an app secret or certificate by using regex to match Json Web Token (JWT)
+        if ($ApplicationInfo.AppSecret -match "^([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_\-\+\/=]*)") {
+            $jwtParams = @{
+                CertificateThumbprint = $ApplicationInfo.CertificateThumbprint
+                CertificateStore      = $CertificateStore
+                Issuer                = $ApplicationInfo.ClientID
+                Audience              = "$AzureADEndpoint/$($ApplicationInfo.TenantID)/oauth2/v2.0/token"
+                Subject               = $ApplicationInfo.ClientID
             }
+            $jwt = Get-NewJsonWebToken @jwtParams
 
-            # Check if we use an app secret or certificate by using regex to match Json Web Token (JWT)
-            if ($ApplicationInfo.AppSecret -match "^([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_\-\+\/=]*)") {
-                $jwtParams = @{
-                    CertificateThumbprint = $ApplicationInfo.CertificateThumbprint
-                    CertificateStore      = $CertificateStore
-                    Issuer                = $ApplicationInfo.ClientID
-                    Audience              = "$AzureADEndpoint/$($ApplicationInfo.TenantID)/oauth2/v2.0/token"
-                    Subject               = $ApplicationInfo.ClientID
-                }
-                $jwt = Get-NewJsonWebToken @jwtParams
-
-                if ($null -eq $jwt) {
-                    Write-Host "Unable to sign a new Json Web Token by using certificate: $($ApplicationInfo.CertificateThumbprint)" -ForegroundColor Red
-                    exit
-                }
-
-                $createOAuthTokenParams.Add("Secret", $jwt)
-            } else {
-                $createOAuthTokenParams.Add("Secret", $ApplicationInfo.AppSecret)
-            }
-
-            $oAuthReturnObject = Get-NewOAuthToken @createOAuthTokenParams
-            if ($oAuthReturnObject.Successful -eq $false) {
-                Write-Host ""
-                Write-Host "Unable to refresh EWS OAuth token. Please review the error message below and re-run the script:" -ForegroundColor Red
-                Write-Host $oAuthReturnObject.ExceptionMessage -ForegroundColor Red
+            if ($null -eq $jwt) {
+                Write-Host "Unable to sign a new Json Web Token by using certificate: $($ApplicationInfo.CertificateThumbprint)" -ForegroundColor Red
                 exit
             }
-            Write-Host "Obtained a new token" -ForegroundColor Green
-            $Token.Value = $oAuthReturnObject.OAuthToken
-            $script:tokenLastRefreshTime = $oAuthReturnObject.LastTokenRefreshTime
-            #$Script:EWSToken = $oAuthReturnObject.OAuthToken.access_token
-            $Script:ewsService = EWSAuth -Environment $Environment -Token $Token.Value -EWSOnlineURL $Script:ewsOnlineURL
+
+            $createOAuthTokenParams.Add("Secret", $jwt)
         } else {
-            return $Script:Ewsserv
+            $createOAuthTokenParams.Add("Secret", $ApplicationInfo.AppSecret)
+        }
+
+        $oAuthReturnObject = Get-ApplicationAccessToken @createOAuthTokenParams
+        if ($oAuthReturnObject.Successful -eq $false) {
+            Write-Host ""
+            Write-Host "Unable to refresh EWS OAuth token. Please review the error message below and re-run the script:" -ForegroundColor Red
+            Write-Host $oAuthReturnObject.ExceptionMessage -ForegroundColor Red
+            exit
+        }
+        Write-Host "Obtained a new token" -ForegroundColor Green
+        $Script:Token = $oAuthReturnObject.OAuthToken.access_token
+        $script:tokenLastRefreshTime = $oAuthReturnObject.LastTokenRefreshTime
+        }
+        else {
+            # Request an authorization code from the Microsoft Azure Active Directory endpoint
+            $redeemAuthCodeParams = @{
+                Uri             = "$AzureADEndpoint/organizations/oauth2/v2.0/token"
+                Method          = "POST"
+                ContentType     = "application/x-www-form-urlencoded"
+                Body            = @{
+                    client_id     = $ApplicationInfo.ClientID
+                    scope         = $AuthScope
+                    grant_type    = "refresh_token"
+                    refresh_token =  $Script:RefreshToken
+                }
+                UseBasicParsing = $true
+            }
+            $redeemAuthCodeResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $redeemAuthCodeParams
+
+            if ($redeemAuthCodeResponse.StatusCode -eq 200) {
+                $tokens = $redeemAuthCodeResponse.Content | ConvertFrom-Json
+                $script:tokenLastRefreshTime = (Get-Date)
+                $Script:RefreshToken = $tokens.refresh_token
+                $Script:Token = $tokens.access_token
+            } 
+            else {
+                Write-Host "Unable to redeem the authorization code for an access token." -ForegroundColor Red
+                exit
+            }
         }
     }
+}
 
-    # End of CSS functions
+function Get-DelegatedAccessToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)][string]$AzureADEndpoint = "https://login.microsoftonline.com",
+        [Parameter(Mandatory = $true)][string]$Scope,
+        [Parameter(Mandatory = $false)][string]$ClientID,
+        [Parameter(Mandatory = $false)][string]$RedirectUri
+    )
 
-    function LoadEWSManagedAPI {
-        $path = $DLLPath
+    <#
+        This function is used to get an access token for the Azure Graph API by using the OAuth 2.0 authorization code flow
+        with PKCE (Proof Key for Code Exchange). The OAuth 2.0 authorization code grant type, or auth code flow,
+        enables a client application to obtain authorized access to protected resources like web APIs.
+        The auth code flow requires a user-agent that supports redirection from the authorization server
+        (the Microsoft identity platform) back to your application.
 
-        if ([System.String]::IsNullOrEmpty($path)) {
-            Write-Host "Trying to find Microsoft.Exchange.WebServices.dll in the script folder"
-            $path = (Get-ChildItem -LiteralPath "$PSScriptRoot\EWS" -Recurse -Filter "Microsoft.Exchange.WebServices.dll" -ErrorAction SilentlyContinue |
-                    Select-Object -First 1).FullName
+        More information about the auth code flow with PKCE can be found here:
+        https://learn.microsoft.com/azure/active-directory/develop/v2-oauth2-auth-code-flow#protocol-details
+    #>
 
-            if ([System.String]::IsNullOrEmpty($path)) {
-                Write-Host "Microsoft.Exchange.WebServices.dll wasn't found - attempting to download it from the internet" -ForegroundColor Yellow
-                $nuGetPackage = Get-NuGetPackage -PackageId "Microsoft.Exchange.WebServices" -Author "Microsoft"
+    begin {
+        Write-Verbose "Calling $($MyInvocation.MyCommand)"
+       
+        $responseType = "code" # Provides the code as a query string parameter on our redirect URI
+        $prompt = "select_account" # We want to show the select account dialog
+        $codeChallengeMethod = "S256" # The code challenge method is S256 (SHA256)
+        $codeChallengeVerifier = Get-NewS256CodeChallengeVerifier
+        $state = ([guid]::NewGuid()).Guid
+        $connectionSuccessful = $false
+    }
+    process {
+        $codeChallenge = $codeChallengeVerifier.CodeChallenge
+        $codeVerifier = $codeChallengeVerifier.Verifier
 
-                if ($nuGetPackage.DownloadSuccessful) {
-                    $unzipNuGetPackage = Invoke-ExtractArchive -CompressedFilePath $nuGetPackage.NuGetPackageFullPath -TargetFolder "$PSScriptRoot\EWS"
+        # Request an authorization code from the Microsoft Azure Active Directory endpoint
+        $authCodeRequestUrl = "$AzureADEndpoint/organizations/oauth2/v2.0/authorize?client_id=$clientId" +
+        "&response_type=$responseType&redirect_uri=$redirectUri&scope=$scope&state=$state&prompt=$prompt" +
+        "&code_challenge_method=$codeChallengeMethod&code_challenge=$codeChallenge"
 
-                    if ($unzipNuGetPackage.DecompressionSuccessful) {
-                        $path = (Get-ChildItem -Path $unzipNuGetPackage.FullPathToDecompressedFiles -Recurse -Filter "Microsoft.Exchange.WebServices.dll" |
-                                Select-Object -First 1).FullName
-                    } else {
-                        Write-Host "Failed to unzip Microsoft.Exchange.WebServices.dll. Please unzip the package manually." -ForegroundColor Red
-                        exit
-                    }
-                } else {
-                    Write-Host "Failed to download Microsoft.Exchange.WebServices.dll from the internet. Please download the package manually and extract the dll. Provide the path to dll using DLLPath parameter." -ForegroundColor Red
-                    exit
+        Start-Process -FilePath $authCodeRequestUrl
+        $authCodeResponse = Start-LocalListener
+
+        if ($null -ne $authCodeResponse) {
+            # Redeem the returned code for an access token
+            $redeemAuthCodeParams = @{
+                Uri             = "$AzureADEndpoint/organizations/oauth2/v2.0/token"
+                Method          = "POST"
+                ContentType     = "application/x-www-form-urlencoded"
+                Body            = @{
+                    client_id     = $ClientID
+                    scope         = $Scope
+                    code          = ($($authCodeResponse.Split("=")[1]).Split("&")[0])
+                    redirect_uri  = $RedirectUri
+                    grant_type    = "authorization_code"
+                    code_verifier = $codeVerifier
                 }
+                UseBasicParsing = $true
+            }
+            $redeemAuthCodeResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $redeemAuthCodeParams
+
+            if ($redeemAuthCodeResponse.StatusCode -eq 200) {
+                $tokens = $redeemAuthCodeResponse.Content | ConvertFrom-Json
+                $connectionSuccessful = $true
             } else {
-                Write-Host "Microsoft.Exchange.WebServices.dll was found in the script folder" -ForegroundColor Green
+                Write-Host "Unable to redeem the authorization code for an access token." -ForegroundColor Red
+            }
+        } else {
+            Write-Host "Unable to acquire an authorization code from the Microsoft Azure Active Directory endpoint." -ForegroundColor Red
+        }
+    }
+    end {
+        if ($connectionSuccessful) {
+            return [PSCustomObject]@{
+                AccessToken = $tokens.access_token
+                RefreshToken = $tokens.refresh_token
+                #TenantId    = (Convert-JsonWebTokenToObject $tokens.id_token).Payload.tid
+                LastTokenRefreshTime = (Get-Date)
+                Successful           = $true
+            }
+        }
+        exit
+    }
+}
+
+function Convert-JsonWebTokenToObject {
+    param(
+        [Parameter(Mandatory = $true)][ValidatePattern("^([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_\-\+\/=]*)")][string]$Token
+    )
+
+    <#
+        This function can be used to split a JSON web token (JWT) into its header, payload, and signature.
+        The JWT is expected to be in the format of <header>.<payload>.<signature>.
+        The function returns a PSCustomObject with the following properties:
+            Header    - The header of the JWT
+            Payload   - The payload of the JWT
+            Signature - The signature of the JWT
+
+            It returns $null if the JWT is not in the expected format or conversion fails.
+    #>
+
+    begin {
+        Write-Verbose "Calling $($MyInvocation.MyCommand)"
+        function ConvertJwtFromBase64StringWithoutPadding {
+            param(
+                [Parameter(Mandatory = $true)]
+                [string]$Jwt
+            )
+            $Jwt = ($Jwt.Replace("-", "+")).Replace("_", "/")
+            switch ($Jwt.Length % 4) {
+                0 { return [System.Convert]::FromBase64String($Jwt) }
+                2 { return [System.Convert]::FromBase64String($Jwt + "==") }
+                3 { return [System.Convert]::FromBase64String($Jwt + "=") }
+                default { throw "The JWT is not a valid Base64 string." }
+            }
+        }
+    }
+    process {
+        $tokenParts = $Token.Split(".")
+        $tokenHeader = $tokenParts[0]
+        $tokenPayload = $tokenParts[1]
+        $tokenSignature = $tokenParts[2]
+
+        Write-Verbose "Now processing token header..."
+        $tokenHeaderDecoded = [System.Text.Encoding]::UTF8.GetString((ConvertJwtFromBase64StringWithoutPadding $tokenHeader))
+
+        Write-Verbose "Now processing token payload..."
+        $tokenPayloadDecoded = [System.Text.Encoding]::UTF8.GetString((ConvertJwtFromBase64StringWithoutPadding $tokenPayload))
+
+        Write-Verbose "Now processing token signature..."
+        $tokenSignatureDecoded = [System.Text.Encoding]::UTF8.GetString((ConvertJwtFromBase64StringWithoutPadding $tokenSignature))
+    }
+    end {
+        if (($null -ne $tokenHeaderDecoded) -and
+            ($null -ne $tokenPayloadDecoded) -and
+            ($null -ne $tokenSignatureDecoded)) {
+            Write-Verbose "Conversion of the token was successful"
+            return [PSCustomObject]@{
+                Header    = ($tokenHeaderDecoded | ConvertFrom-Json)
+                Payload   = ($tokenPayloadDecoded | ConvertFrom-Json)
+                Signature = $tokenSignatureDecoded
             }
         }
 
-        if ($path -notlike "*Microsoft.Exchange.WebServices.dll") {
-            $path = "$path\Microsoft.Exchange.WebServices.dll"
-        }
+        Write-Verbose "Conversion of the token failed"
+        return $null
+    }
+}
 
-        try {
-            Import-Module -Name $path -ErrorAction Stop
-            return $true
-        } catch {
-            Write-Host "Failed to import Microsoft.Exchange.WebServices.dll Inner Exception`n`n$_" -ForegroundColor Red
-            exit
+function Get-NewS256CodeChallengeVerifier {
+    param()
+
+    <#
+        This function can be used to generate a new SHA256 code challenge and verifier following the PKCE specification.
+        The Proof Key for Code Exchange (PKCE) extension describes a technique for public clients to mitigate the threat
+        of having the authorization code intercepted. The technique involves the client first creating a secret,
+        and then using that secret again when exchanging the authorization code for an access token.
+
+        The function returns a PSCustomObject with the following properties:
+        Verifier: The verifier that was generated
+        CodeChallenge: The code challenge that was generated
+
+        It returns $null if the code challenge and verifier generation fails.
+
+        More information about the auth code flow with PKCE can be found here:
+        https://www.rfc-editor.org/rfc/rfc7636
+    #>
+
+    Write-Verbose "Calling $($MyInvocation.MyCommand)"
+
+    $bytes = [System.Byte[]]::new(64)
+    ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($bytes)
+    $b64String = [Convert]::ToBase64String($bytes)
+    $verifier = (($b64String.TrimEnd("=")).Replace("+", "-")).Replace("/", "_")
+
+    $newMemoryStream = [System.IO.MemoryStream]::new()
+    $newStreamWriter = [System.IO.StreamWriter]::new($newMemoryStream)
+    $newStreamWriter.write($verifier)
+    $newStreamWriter.Flush()
+    $newMemoryStream.Position = 0
+    $hash = Get-FileHash -InputStream $newMemoryStream | Select-Object Hash
+    $hex = $hash.Hash
+
+    $bytesArray = [byte[]]::new($hex.Length / 2)
+
+    for ($i = 0; $i -lt $hex.Length; $i+=2) {
+        $bytesArray[$i/2] = [Convert]::ToByte($hex.Substring($i, 2), 16)
+    }
+
+    $base64Encoded = [Convert]::ToBase64String($bytesArray)
+    $base64UrlEncoded = (($base64Encoded.TrimEnd("=")).Replace("+", "-")).Replace("/", "_")
+
+    if ((-not([System.String]::IsNullOrEmpty($verifier))) -and
+        (-not([System.String]::IsNullOrEmpty(($base64UrlEncoded))))) {
+        Write-Verbose "Verifier and CodeChallenge generated successfully"
+        return [PSCustomObject]@{
+            Verifier      = $verifier
+            CodeChallenge = $base64UrlEncoded
         }
     }
-    function CreateService($smtpAddress, $impersonatedAddress = "") {
-        # Creates and returns an ExchangeService object to be used to access mailboxes
-        $Script:applicationInfo = @{
-            "TenantID" = $OAuthTenantId
-            "ClientID" = $OAuthClientId
+
+    Write-Verbose "Verifier and CodeChallenge generation failed"
+    return $null
+}
+
+function Start-LocalListener {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only non-destructive operations are performed in this function.')]
+    param(
+        [Parameter(Mandatory = $false)][int]$Port = 8004,
+        [Parameter(Mandatory = $false)][int]$TimeoutSeconds = 60,
+        [Parameter(Mandatory = $false)][string]$UrlContains = "code=",
+        [Parameter(Mandatory = $false)][string]$ExpectedHttpMethod = "GET",
+        [Parameter(Mandatory = $false)][string]$ResponseOutput = "Authentication complete. You can return to the application. Feel free to close this browser tab."
+    )
+
+    <#
+        This function is used to start a local listener on the specified port (default: 8004).
+        It will wait for the specified amount of seconds (default: 60) for a request to be made.
+        The function will return the URL of the request that was made.
+    #>
+
+    begin {
+        Write-Verbose "Calling $($MyInvocation.MyCommand)"
+        $url = $null
+        $signalled = $false
+        $stopwatch = New-Object System.Diagnostics.Stopwatch
+        $listener = New-Object Net.HttpListener
+    }
+    process {
+        $listener.Prefixes.add("http://localhost:$($Port)/")
+        try {
+            Write-Verbose "Starting listener..."
+            Write-Verbose "Listening on port: $($Port)"
+            Write-Verbose "Waiting $($TimeoutSeconds) seconds for request to be made to url that contains: $($UrlContains)"
+            $stopwatch.Start()
+            $listener.Start()
+
+            while ($listener.IsListening) {
+                $task = $listener.GetContextAsync()
+
+                while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+                    if ($task.AsyncWaitHandle.WaitOne(100)) {
+                        $signalled = $true
+                        break
+                    }
+                    Start-Sleep -Milliseconds 100
+                }
+
+                if ($signalled) {
+                    $context = $task.GetAwaiter().GetResult()
+                    $request = $context.Request
+                    $response = $context.Response
+                    $url = $request.RawUrl
+                    $content = [byte[]]@()
+
+                    if (($url.Contains($UrlContains)) -and
+                        ($request.HttpMethod -eq $ExpectedHttpMethod)) {
+                        Write-Verbose "Request made to listener and url that was called is as expected. HTTP Method: $($request.HttpMethod)"
+                        $content = [System.Text.Encoding]::UTF8.GetBytes($ResponseOutput)
+                        $response.StatusCode = 200 # OK
+                        $response.OutputStream.Write($content, 0, $content.Length)
+                        $response.Close()
+                        break
+                    } else {
+                        Write-Verbose "Request made to listener but the url that was called is not as expected. URL: $($url)"
+                        $response.StatusCode = 404 # Not Found
+                        $response.OutputStream.Write($content, 0, $content.Length)
+                        $response.Close()
+                        break
+                    }
+                } else {
+                    Write-Verbose "Timeout of $($TimeoutSeconds) seconds reached..."
+                    break
+                }
+            }
+        } finally {
+            Write-Verbose "Stopping listener..."
+            Start-Sleep -Seconds 2
+            $stopwatch.Stop()
+            $listener.Stop()
+        }
+    }
+    end {
+        return $url
+    }
+}
+
+function Invoke-WebRequestWithProxyDetection {
+    [CmdletBinding(DefaultParameterSetName = "Default")]
+    param (
+        [Parameter(Mandatory = $true, ParameterSetName = "Default")][string]$Uri,
+        [Parameter(Mandatory = $false, ParameterSetName = "Default")][switch]$UseBasicParsing,
+        [Parameter(Mandatory = $true, ParameterSetName = "ParametersObject")][hashtable]$ParametersObject,
+        [Parameter(Mandatory = $false, ParameterSetName = "Default")][string]$OutFile
+    )
+
+    Write-Verbose "Calling $($MyInvocation.MyCommand)"
+    if ([System.String]::IsNullOrEmpty($Uri)) {
+        $Uri = $ParametersObject.Uri
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    if (Confirm-ProxyServer -TargetUri $Uri) {
+        $webClient = New-Object System.Net.WebClient
+        $webClient.Headers.Add("User-Agent", "PowerShell")
+        $webClient.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    }
+
+    if ($null -eq $ParametersObject) {
+        $params = @{
+            Uri     = $Uri
+            OutFile = $OutFile
+        }
+
+        if ($UseBasicParsing) {
+            $params.UseBasicParsing = $true
+        }
+    } else {
+        $params = $ParametersObject
+    }
+
+    try {
+        Invoke-WebRequest @params
+    } catch {
+        Write-VerboseErrorInformation
+    }
+}
+
+function Confirm-ProxyServer {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param (
+        [Parameter(Mandatory = $true)][string]$TargetUri
+    )
+
+    Write-Verbose "Calling $($MyInvocation.MyCommand)"
+    try {
+        $proxyObject = ([System.Net.WebRequest]::GetSystemWebProxy()).GetProxy($TargetUri)
+        if ($TargetUri -ne $proxyObject.OriginalString) {
+            Write-Verbose "Proxy server configuration detected"
+            Write-Verbose $proxyObject.OriginalString
+            return $true
+        } else {
+            Write-Verbose "No proxy server configuration detected"
+            return $false
+        }
+    } catch {
+        Write-Verbose "Unable to check for proxy server configuration"
+        return $false
+    }
+}
+
+function WriteErrorInformationBase {
+    [CmdletBinding()]
+    param(
+        [object]$CurrentError = $Error[0],
+        [ValidateSet("Write-Host", "Write-Verbose")][string]$Cmdlet
+    )
+
+    if ($null -ne $CurrentError.OriginInfo) {
+        & $Cmdlet "Error Origin Info: $($CurrentError.OriginInfo.ToString())"
+    }
+
+    & $Cmdlet "$($CurrentError.CategoryInfo.Activity) : $($CurrentError.ToString())"
+
+    if ($null -ne $CurrentError.Exception -and
+        $null -ne $CurrentError.Exception.StackTrace) {
+        & $Cmdlet "Inner Exception: $($CurrentError.Exception.StackTrace)"
+    } elseif ($null -ne $CurrentError.Exception) {
+        & $Cmdlet "Inner Exception: $($CurrentError.Exception)"
+    }
+
+    if ($null -ne $CurrentError.InvocationInfo.PositionMessage) {
+        & $Cmdlet "Position Message: $($CurrentError.InvocationInfo.PositionMessage)"
+    }
+
+    if ($null -ne $CurrentError.Exception.SerializedRemoteInvocationInfo.PositionMessage) {
+        & $Cmdlet "Remote Position Message: $($CurrentError.Exception.SerializedRemoteInvocationInfo.PositionMessage)"
+    }
+
+    if ($null -ne $CurrentError.ScriptStackTrace) {
+        & $Cmdlet "Script Stack: $($CurrentError.ScriptStackTrace)"
+    }
+}
+
+function Write-VerboseErrorInformation {
+    [CmdletBinding()]
+    param(
+        [object]$CurrentError = $Error[0]
+    )
+    WriteErrorInformationBase $CurrentError "Write-Verbose"
+}
+
+function Write-HostErrorInformation {
+    [CmdletBinding()]
+    param(
+        [object]$CurrentError = $Error[0]
+    )
+    WriteErrorInformationBase $CurrentError "Write-Host"
+}
+
+function Get-OAuthToken {
+    param(
+        [array]$AppScope,
+        [Parameter(Mandatory=$true)] [ValidateSet('EWS','Graph')][string]$Api
+    )
+    Write-Verbose "Calling $($MyInvocation.MyCommand)"
+    $EwsUri = $Script:EwsEndpoint.Substring(0,$Script:EwsEndpoint.IndexOf("/EWS/"))
+    if($PermissionType -eq "Application") {
+        switch ($Api) {
+            "EWS" {
+                
+                $Script:TokenScope = "$($EwsUri)/.default"
+            }
+            "Graph" {
+                $Script:TokenScope = "$($cloudService.graphApiEndpoint)/.default"
+            }
         }
 
         if ([System.String]::IsNullOrEmpty($OAuthCertificate)) {
             $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($OAuthClientSecret)
             $Secret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
             $Script:applicationInfo.Add("AppSecret", $Secret)
-        } else {
+        }
+        else {
             $jwtParams = @{
                 CertificateThumbprint = $OAuthCertificate
                 CertificateStore      = $CertificateStore
@@ -1002,316 +1337,409 @@ function Show-Disclaimer {
                 Subject               = $OAuthClientId
             }
             $jwt = Get-NewJsonWebToken @jwtParams
-
+    
             if ($null -eq $jwt) {
                 Write-Host "Unable to generate Json Web Token by using certificate: $CertificateThumbprint" -ForegroundColor Red
                 exit
             }
-
+    
             $Script:applicationInfo.Add("AppSecret", $jwt)
             $Script:applicationInfo.Add("CertificateThumbprint", $OAuthCertificate)
         }
-
+    
         $createOAuthTokenParams = @{
             TenantID                       = $OAuthTenantId
             ClientID                       = $OAuthClientId
             Secret                         = $Script:applicationInfo.AppSecret
-            Scope                          = $Script:ewsOnlineScope
+            Scope                          = $Script:TokenScope
             Endpoint                       = $azureADEndpoint
             CertificateBasedAuthentication = (-not([System.String]::IsNullOrEmpty($OAuthCertificate)))
         }
-
+    
         #Create OAUTH token
-        $oAuthReturnObject = Get-NewOAuthToken @createOAuthTokenParams
+        $oAuthReturnObject = Get-ApplicationAccessToken @createOAuthTokenParams
         if ($oAuthReturnObject.Successful -eq $false) {
             Write-Host ""
             Write-Host "Unable to fetch an OAuth token for accessing EWS. Please review the error message below and re-run the script:" -ForegroundColor Red
             Write-Host $oAuthReturnObject.ExceptionMessage -ForegroundColor Red
             exit
         }
-        $Script:EWSToken = $oAuthReturnObject.OAuthToken
+        $Script:Token = $oAuthReturnObject.OAuthToken.access_token
         $Script:tokenLastRefreshTime = $oAuthReturnObject.LastTokenRefreshTime
-        $Script:ewsService = EWSAuth -Environment $Environment -Token $Script:EWSToken -EWSOnlineURL $Script:ewsOnlineURL
-        return $Script:ewsService
     }
-
-    function EWSPropertyType($MAPIPropertyType) {
-        # Return the EWS property type for the given MAPI Property value
-
-        switch ([Convert]::ToInt32($MAPIPropertyType, 16)) {
-            0x0 { return $Null }
-            0x1 { return $Null }
-            0x2 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Short }
-            0x1002 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ShortArray }
-            0x3 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Integer }
-            0x1003 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::IntegerArray }
-            0x4 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Float }
-            0x1004 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::FloatArray }
-            0x5 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Double }
-            0x1005 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::DoubleArray }
-            0x6 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Currency }
-            0x1006 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::CurrencyArray }
-            0x7 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ApplicationTime }
-            0x1007 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ApplicationTimeArray }
-            0x0A { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Error }
-            0x0B { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Boolean }
-            0x0D { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Object }
-            0x100D { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ObjectArray }
-            0x14 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Long }
-            0x1014 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::LongArray }
-            0x1E { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::String }
-            0x101E { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::StringArray }
-            0x1F { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::String }
-            0x101F { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::StringArray }
-            0x40 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::SystemTime }
-            0x1040 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::SystemTimeArray }
-            0x48 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::CLSID }
-            0x1048 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::CLSIDArray }
-            0x102 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Binary }
-            0x1102 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::BinaryArray }
+    elseif ($PermissionType -eq "Delegated") {
+        if(-not(($AppScope.Contains("email")))) {
+            $AppScope += "email"
         }
-        Write-Verbose "Couldn't match MAPI property type"
-        return $Null
+        if(-not(($AppScope.Contains("openid")))) {
+            $AppScope += "openid"
+        }
+        if(-not(($AppScope.Contains("offline_access")))) {
+            $AppScope += "offline_access"
+        }
+        switch ($Api) {
+            "EWS" {
+                $Script:TokenScope = "$($EwsUri)//$($Scope)"
+            }
+            "Graph" {
+                $Script:TokenScope = "$($cloudService.GraphApiEndpoint)//$($Scope)"
+            }
+        }
+        
+        $oAuthReturnObject = Get-DelegatedAccessToken -AzureADEndpoint $cloudService.AzureADEndpoint -Scope $Script:TokenScope -ClientID $OAuthClientId -RedirectUri $OAuthRedirectUri
+        if ($oAuthReturnObject.Successful -eq $false) {
+            Write-Host ""
+            Write-Host "Unable to fetch an OAuth token for accessing EWS. Please review the error message below and re-run the script:" -ForegroundColor Red
+            Write-Host $oAuthReturnObject.ExceptionMessage -ForegroundColor Red
+            exit
+        }    
+        $Script:tokenLastRefreshTime = $oAuthReturnObject.LastTokenRefreshTime
+        $Script:Token = $oAuthReturnObject.AccessToken
+        $Script:RefreshToken = $oAuthReturnObject.RefreshToken
+    }
+}
+
+function LoadEWSManagedAPI {
+    $path = $DLLPath
+
+    if ([System.String]::IsNullOrEmpty($path)) {
+        Write-Host "Trying to find Microsoft.Exchange.WebServices.dll in the script folder"
+        $path = (Get-ChildItem -LiteralPath "$PSScriptRoot\EWS" -Recurse -Filter "Microsoft.Exchange.WebServices.dll" -ErrorAction SilentlyContinue |
+                Select-Object -First 1).FullName
+
+        if ([System.String]::IsNullOrEmpty($path)) {
+            Write-Host "Microsoft.Exchange.WebServices.dll wasn't found - attempting to download it from the internet" -ForegroundColor Yellow
+            $nuGetPackage = Get-NuGetPackage -PackageId "Microsoft.Exchange.WebServices" -Author "Microsoft"
+
+            if ($nuGetPackage.DownloadSuccessful) {
+                $unzipNuGetPackage = Invoke-ExtractArchive -CompressedFilePath $nuGetPackage.NuGetPackageFullPath -TargetFolder "$PSScriptRoot\EWS"
+
+                if ($unzipNuGetPackage.DecompressionSuccessful) {
+                    $path = (Get-ChildItem -Path $unzipNuGetPackage.FullPathToDecompressedFiles -Recurse -Filter "Microsoft.Exchange.WebServices.dll" |
+                            Select-Object -First 1).FullName
+                } else {
+                    Write-Host "Failed to unzip Microsoft.Exchange.WebServices.dll. Please unzip the package manually." -ForegroundColor Red
+                    exit
+                }
+            } else {
+                Write-Host "Failed to download Microsoft.Exchange.WebServices.dll from the internet. Please download the package manually and extract the dll. Provide the path to dll using DLLPath parameter." -ForegroundColor Red
+                exit
+            }
+        } else {
+            Write-Host "Microsoft.Exchange.WebServices.dll was found in the script folder" -ForegroundColor Green
+        }
     }
 
-    function InitPropList() {
-        # We need to convert the properties to EWS extended properties
-        if ($null -eq $script:itemPropsEws) {
-            Write-Verbose "Building list of properties to retrieve"
-            $script:property = @()
-            foreach ($property in $ViewProperties) {
-                $propDef = $null
+    if ($path -notlike "*Microsoft.Exchange.WebServices.dll") {
+        $path = "$path\Microsoft.Exchange.WebServices.dll"
+    }
 
-                if ($property.StartsWith("{")) {
-                    # Property definition starts with a GUID, so we expect one of these:
-                    # {GUID}/name/mapiType - named property
-                    # {GUID]/id/mapiType   - MAPI property (shouldn't be used when accessing named properties)
+    try {
+        Import-Module -Name $path -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Host "Failed to import Microsoft.Exchange.WebServices.dll Inner Exception`n`n$_" -ForegroundColor Red
+        exit
+    }
+}
+function CreateService($smtpAddress, $impersonatedAddress = "") {
+    # Creates and returns an ExchangeService object to be used to access mailboxes
+    $Script:ewsService = EWSAuth -Environment $Environment -Token $Script:Token -EwsUri $Script:EwsEndpoint
+    return $Script:ewsService
+}
 
-                    $propElements = $property -Split "/"
-                    if ($propElements.Length -eq 2) {
-                        # We expect three elements, but if there are two it most likely means that the MAPI property Id includes the Mapi type
-                        if ($propElements[1].Length -eq 8) {
-                            $propElements += $propElements[1].Substring(4)
-                            $propElements[1] = [Convert]::ToInt32($propElements[1].Substring(0, 4), 16)
-                        }
-                    }
-                    $guid = New-Object Guid($propElements[0])
-                    $propType = EWSPropertyType($propElements[2])
+function EWSPropertyType($MAPIPropertyType) {
+    # Return the EWS property type for the given MAPI Property value
 
-                    try {
-                        $propDef = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition($guid, $propElements[1], $propType)
-                    } catch {
-                        Write-Error "Unable to define property definitions."
-                    }
-                } else {
-                    # Assume MAPI property
-                    if ($property.ToLower().StartsWith("0x")) {
-                        $property = $deleteProperty.SubString(2)
-                    }
-                    $propId = [Convert]::ToInt32($deleteProperty.SubString(0, 4), 16)
-                    $propType = EWSPropertyType($deleteProperty.SubString(5))
+    switch ([Convert]::ToInt32($MAPIPropertyType, 16)) {
+        0x0 { return $Null }
+        0x1 { return $Null }
+        0x2 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Short }
+        0x1002 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ShortArray }
+        0x3 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Integer }
+        0x1003 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::IntegerArray }
+        0x4 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Float }
+        0x1004 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::FloatArray }
+        0x5 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Double }
+        0x1005 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::DoubleArray }
+        0x6 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Currency }
+        0x1006 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::CurrencyArray }
+        0x7 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ApplicationTime }
+        0x1007 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ApplicationTimeArray }
+        0x0A { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Error }
+        0x0B { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Boolean }
+        0x0D { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Object }
+        0x100D { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::ObjectArray }
+        0x14 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Long }
+        0x1014 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::LongArray }
+        0x1E { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::String }
+        0x101E { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::StringArray }
+        0x1F { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::String }
+        0x101F { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::StringArray }
+        0x40 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::SystemTime }
+        0x1040 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::SystemTimeArray }
+        0x48 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::CLSID }
+        0x1048 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::CLSIDArray }
+        0x102 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Binary }
+        0x1102 { return [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::BinaryArray }
+    }
+    Write-Verbose "Couldn't match MAPI property type"
+    return $Null
+}
 
-                    try {
-                        $propDef = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition($propId, $propType)
-                    } catch {
-                        Write-Error "Unable to define property definitions."
+function InitPropList() {
+    # We need to convert the properties to EWS extended properties
+    if ($null -eq $script:itemPropsEws) {
+        Write-Verbose "Building list of properties to retrieve"
+        $script:property = @()
+        foreach ($property in $ViewProperties) {
+            $propDef = $null
+
+            if ($property.StartsWith("{")) {
+                # Property definition starts with a GUID, so we expect one of these:
+                # {GUID}/name/mapiType - named property
+                # {GUID]/id/mapiType   - MAPI property (shouldn't be used when accessing named properties)
+
+                $propElements = $property -Split "/"
+                if ($propElements.Length -eq 2) {
+                    # We expect three elements, but if there are two it most likely means that the MAPI property Id includes the Mapi type
+                    if ($propElements[1].Length -eq 8) {
+                        $propElements += $propElements[1].Substring(4)
+                        $propElements[1] = [Convert]::ToInt32($propElements[1].Substring(0, 4), 16)
                     }
                 }
+                $guid = New-Object Guid($propElements[0])
+                $propType = EWSPropertyType($propElements[2])
 
-                if ($null -ne $propDef) {
-                    $script:property += $propDef
-                    Write-Verbose "Added property $property to list of those to retrieve"
-                } else {
-                    Write-Host "Failed to parse (or convert) property $property" -ForegroundColor Red
+                try {
+                    $propDef = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition($guid, $propElements[1], $propType)
+                } catch {
+                    Write-Error "Unable to define property definitions."
                 }
+            } else {
+                # Assume MAPI property
+                if ($property.ToLower().StartsWith("0x")) {
+                    $property = $deleteProperty.SubString(2)
+                }
+                $propId = [Convert]::ToInt32($deleteProperty.SubString(0, 4), 16)
+                $propType = EWSPropertyType($deleteProperty.SubString(5))
+
+                try {
+                    $propDef = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition($propId, $propType)
+                } catch {
+                    Write-Error "Unable to define property definitions."
+                }
+            }
+
+            if ($null -ne $propDef) {
+                $script:property += $propDef
+                Write-Verbose "Added property $property to list of those to retrieve"
+            } else {
+                Write-Host "Failed to parse (or convert) property $property" -ForegroundColor Red
             }
         }
     }
+}
 
-    $script:excludedProperties = @("Schema", "Service", "IsDirty", "IsAttachment", "IsNew")
-    $script:itemRetryCount = @{}
-    
-    function InitLists() {
-        $genericItemIdList = [System.Collections.Generic.List``1].MakeGenericType([Microsoft.Exchange.WebServices.Data.ItemId])
-        $script:ItemsToDelete = [Activator]::CreateInstance($genericItemIdList)
+$script:excludedProperties = @("Schema", "Service", "IsDirty", "IsAttachment", "IsNew")
+$script:itemRetryCount = @{}
+
+function InitLists() {
+    $genericItemIdList = [System.Collections.Generic.List``1].MakeGenericType([Microsoft.Exchange.WebServices.Data.ItemId])
+    $script:ItemsToDelete = [Activator]::CreateInstance($genericItemIdList)
+}
+
+function ProcessItem( $item ) {
+    # We have found an item, so this function handles any processing
+    $script:RequiredPropSet = new-object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties)  
+    #PR_POLICY_TAG 0x3019
+    $PolicyTag = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition(0x3019, [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Binary);
+    #PR_RETENTION_DATE 0x301C
+    $RetentionDate = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition(0x301C, [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::SystemTime);
+    $script:RequiredPropSet.Add($PolicyTag)
+    $script:RequiredPropSet.Add($RetentionDate)
+    $item.Load($script:RequiredPropSet)
+
+    $itemResult = New-Object PSObject -Property @{ InternetMessageId=$item.InternetMessageId; Sender=$item.Sender; ReceivedBy=$item.ReceivedBy; Id=$item.Id; ItemClass=$item.ItemClass; Subject=$item.Subject; DateTimeCreated=$item.DateTimeCreated; Folder=$folderPath; MailboxType=$Script:MailboxType; RetentionPeriod = $item.RetentionDate; PolicyTag = $item.PolicyTag }
+    $itemResult | Export-Csv -Path $ResultsFile -NoTypeInformation -Append
+}
+
+function GetFolder() {
+    # Return a reference to a folder specified by path
+
+    $RootFolder, $FolderPath, $Create = $args[0]
+
+    if ($null -eq  $RootFolder) {
+        #LogVerbose "GetFolder called with null root folder"
+        return $null
     }
 
-    function ProcessItem( $item ) {
-        # We have found an item, so this function handles any processing
-        $script:RequiredPropSet = new-object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties)  
-        #PR_POLICY_TAG 0x3019
-        $PolicyTag = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition(0x3019, [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::Binary);
-        #PR_RETENTION_DATE 0x301C
-        $RetentionDate = New-Object Microsoft.Exchange.WebServices.Data.ExtendedPropertyDefinition(0x301C, [Microsoft.Exchange.WebServices.Data.MapiPropertyType]::SystemTime);
-        $script:RequiredPropSet.Add($PolicyTag)
-        $script:RequiredPropSet.Add($RetentionDate)
-        $item.Load($script:RequiredPropSet)
-
-        $itemResult = New-Object PSObject -Property @{ InternetMessageId=$item.InternetMessageId; Sender=$item.Sender; ReceivedBy=$item.ReceivedBy; Id=$item.Id; ItemClass=$item.ItemClass; Subject=$item.Subject; DateTimeCreated=$item.DateTimeCreated; Folder=$folderPath; MailboxType=$Script:MailboxType; RetentionPeriod = $item.RetentionDate; PolicyTag = $item.PolicyTag }
-        $itemResult | Export-Csv -Path $ResultsFile -NoTypeInformation -Append
+    if ($FolderPath.ToLower().StartsWith("wellknownfoldername")) {
+        # Well known folder, so bind to it directly
+        $wkf = $FolderPath.SubString(20)
+        #LogVerbose "Attempting to bind to well known folder: $wkf"
+        $folderId = New-Object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::$wkf, $mbx )
+        $Folder = ThrottledFolderBind($folderId)
+        return $Folder
     }
 
-    function GetFolder() {
-        # Return a reference to a folder specified by path
-
-        $RootFolder, $FolderPath, $Create = $args[0]
-
-        if ($null -eq  $RootFolder) {
-            #LogVerbose "GetFolder called with null root folder"
-            return $null
-        }
-
-        if ($FolderPath.ToLower().StartsWith("wellknownfoldername")) {
-            # Well known folder, so bind to it directly
-            $wkf = $FolderPath.SubString(20)
-            #LogVerbose "Attempting to bind to well known folder: $wkf"
-            $folderId = New-Object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::$wkf, $mbx )
-            $Folder = ThrottledFolderBind($folderId)
-            return $Folder
-        }
-
-        $Folder = $RootFolder
-        if ($FolderPath -ne '\') {
-            $PathElements = $FolderPath -split '\\'
-            for ($i=0; $i -lt $PathElements.Count; $i++) {
-                if ($PathElements[$i]) {
-                    $View = New-Object  Microsoft.Exchange.WebServices.Data.FolderView(2, 0)
-                    $View.PropertySet = [Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly
-                    $SearchFilter = New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName, $PathElements[$i])
-                    $FolderResults = $Null
-                    try {
-                        $FolderResults = $Folder.FindFolders($SearchFilter, $View)
-                    } catch {
-                        Write-Error "Unable to locate folders."
-                    }
-                    if ($null -eq $FolderResults) {
-                        if (Throttled) {
-                            try {
-                                $FolderResults = $Folder.FindFolders($SearchFilter, $View)
-                            } catch {
-                                Write-Error "Unable to locate folders."
-                            }
+    $Folder = $RootFolder
+    if ($FolderPath -ne '\') {
+        $PathElements = $FolderPath -split '\\'
+        for ($i=0; $i -lt $PathElements.Count; $i++) {
+            if ($PathElements[$i]) {
+                $View = New-Object  Microsoft.Exchange.WebServices.Data.FolderView(2, 0)
+                $View.PropertySet = [Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly
+                $SearchFilter = New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName, $PathElements[$i])
+                $FolderResults = $Null
+                try {
+                    $FolderResults = $Folder.FindFolders($SearchFilter, $View)
+                } catch {
+                    Write-Error "Unable to locate folders."
+                }
+                if ($null -eq $FolderResults) {
+                    if (Throttled) {
+                        try {
+                            $FolderResults = $Folder.FindFolders($SearchFilter, $View)
+                        } catch {
+                            Write-Error "Unable to locate folders."
                         }
                     }
+                }
 
-                    if ($null -eq $FolderResults) {
-                        return $null
-                    }
+                if ($null -eq $FolderResults) {
+                    return $null
+                }
 
-                    if ($FolderResults.TotalCount -gt 1) {
-                        # We have more than one folder returned... We shouldn't ever get this, as it means we have duplicate folders
-                        $Folder = $null
-                        Write-Host "Duplicate folders ($($PathElements[$i])) found in path $FolderPath" -ForegroundColor Red
-                        break
-                    } elseif ( $FolderResults.TotalCount -eq 0 ) {
-                        if ($Create) {
-                            # Folder not found, so attempt to create it
-                            $subfolder = New-Object Microsoft.Exchange.WebServices.Data.Folder($RootFolder.Service)
-                            $subfolder.DisplayName = $PathElements[$i]
-                            try {
-                                $subfolder.Save($Folder.Id)
-                                #LogVerbose "Created folder $($PathElements[$i])"
-                            } catch {
-                                # Failed to create the subfolder
-                                $Folder = $null
-                                Write-Host "Failed to create folder $($PathElements[$i]) in path $FolderPath" -ForegroundColor Red
-                                break
-                            }
-                            $Folder = $subfolder
-                        } else {
-                            # Folder doesn't exist
+                if ($FolderResults.TotalCount -gt 1) {
+                    # We have more than one folder returned... We shouldn't ever get this, as it means we have duplicate folders
+                    $Folder = $null
+                    Write-Host "Duplicate folders ($($PathElements[$i])) found in path $FolderPath" -ForegroundColor Red
+                    break
+                } elseif ( $FolderResults.TotalCount -eq 0 ) {
+                    if ($Create) {
+                        # Folder not found, so attempt to create it
+                        $subfolder = New-Object Microsoft.Exchange.WebServices.Data.Folder($RootFolder.Service)
+                        $subfolder.DisplayName = $PathElements[$i]
+                        try {
+                            $subfolder.Save($Folder.Id)
+                            #LogVerbose "Created folder $($PathElements[$i])"
+                        } catch {
+                            # Failed to create the subfolder
                             $Folder = $null
-                            Write-Host "Folder $($PathElements[$i]) doesn't exist in path $FolderPath" -ForegroundColor Red
+                            Write-Host "Failed to create folder $($PathElements[$i]) in path $FolderPath" -ForegroundColor Red
                             break
                         }
+                        $Folder = $subfolder
                     } else {
-                        $Folder = ThrottledFolderBind $FolderResults.Folders[0].Id $null $RootFolder.Service
+                        # Folder doesn't exist
+                        $Folder = $null
+                        Write-Host "Folder $($PathElements[$i]) doesn't exist in path $FolderPath" -ForegroundColor Red
+                        break
                     }
-                }
-            }
-        }
-
-        $Folder
-    }
-
-    function SearchMailbox() {
-        $Script:ewsService = CreateService($Mailbox)
-        if ($null -eq $Script:ewsService) {
-            return
-        }
-        # Set our root folder
-        if ($Archive) {
-            $Script:MailboxType = "Archive"
-            if ($SearchDumpster) {
-                $ProcessSubfolders = $True
-                $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::ArchiveRecoverableItemsRoot
-            } else {
-                $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::ArchiveMsgFolderRoot
-            }
-        } else {
-            $Script:MailboxType = "Primary"
-            if ($SearchDumpster) {
-                $ProcessSubfolders = $True
-                $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::RecoverableItemsRoot
-            } else {
-                $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::MsgFolderRoot
-            }
-        }
-
-        #InitPropList
-
-        if (!($IncludeFolderList)) {
-            # No folders specified to search, so the entire mailbox will be searched
-            $FolderId = New-Object Microsoft.Exchange.WebServices.Data.FolderId( $rootFolderId )
-            $ProcessSubfolders = $true
-            SearchFolder $FolderId
-        } else {
-            # Searching specific folders
-            $rootFolder = ThrottledFolderBind $rootFolderId
-            foreach ($includedFolder in $IncludeFolderList) {
-                $folder = $null
-                $folder = GetFolder($rootFolder, $includedFolder, $false)
-
-                if ($folder) {
-                    $folderPath = GetFolderPath($folder)
-                    SearchFolder $folder.Id
+                } else {
+                    $Folder = ThrottledFolderBind $FolderResults.Folders[0].Id $null $RootFolder.Service
                 }
             }
         }
     }
 
-    function Throttled() {
-        # Checks if we've been throttled.  If we have, we wait for the specified number of BackOffMilliSeconds before returning
+    $Folder
+}
 
-        if ([String]::IsNullOrEmpty($script:Tracer.LastResponse)) {
-            return $false # Throttling does return a response, if we don't have one, then throttling probably isn't the issue (though sometimes throttling just results in a timeout)
+function SearchMailbox() {
+    $Script:ewsService = CreateService($Mailbox)
+    if ($null -eq $Script:ewsService) {
+        return
+    }
+    # Set our root folder
+    if ($Archive) {
+        $Script:MailboxType = "Archive"
+        if ($SearchDumpster) {
+            $ProcessSubfolders = $True
+            $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::ArchiveRecoverableItemsRoot
+        } else {
+            $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::ArchiveMsgFolderRoot
         }
-
-        $lastResponse = $script:Tracer.LastResponse.Replace("<?xml version=`"1.0`" encoding=`"utf-8`"?>", "")
-        $lastResponse = "<?xml version=`"1.0`" encoding=`"utf-8`"?>$lastResponse"
-        $responseXml = [xml]$lastResponse
-
-        if ($responseXml.Trace.Envelope.Body.Fault.detail.MessageXml.Value.Name -eq "BackOffMilliseconds") {
-            # We are throttled, and the server has told us how long to back off for
-            Write-Host "Throttling detected, server requested back off for $($responseXml.Trace.Envelope.Body.Fault.detail.MessageXml.Value."#text") milliseconds" Yellow
-            Start-Sleep -Milliseconds $responseXml.Trace.Envelope.Body.Fault.detail.MessageXml.Value."#text"
-            Write-Host "Throttling budget should now be reset, resuming operations" Gray
-            return $true
+    } else {
+        $Script:MailboxType = "Primary"
+        if ($SearchDumpster) {
+            $ProcessSubfolders = $True
+            $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::RecoverableItemsRoot
+        } else {
+            $rootFolderId = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::MsgFolderRoot
         }
-        return $false
     }
 
-    function ThrottledFolderBind() {
-        param (
-            [Microsoft.Exchange.WebServices.Data.FolderId]$folderId,
-            $propSet = $null,
-            $exchangeService = $null)
+    if (!($IncludeFolderList)) {
+        # No folders specified to search, so the entire mailbox will be searched
+        $FolderId = New-Object Microsoft.Exchange.WebServices.Data.FolderId( $rootFolderId )
+        $ProcessSubfolders = $true
+        SearchFolder $FolderId
+    } else {
+        # Searching specific folders
+        $rootFolder = ThrottledFolderBind $rootFolderId
+        foreach ($includedFolder in $IncludeFolderList) {
+            $folder = $null
+            $folder = GetFolder($rootFolder, $includedFolder, $false)
 
-        $folder = $null
-        if ($null -eq $exchangeService) {
-            $exchangeService = $Script:ewsService
+            if ($folder) {
+                $folderPath = GetFolderPath($folder)
+                SearchFolder $folder.Id
+            }
         }
+    }
+}
 
+function Throttled() {
+    # Checks if we've been throttled.  If we have, we wait for the specified number of BackOffMilliSeconds before returning
+
+    if ([String]::IsNullOrEmpty($script:Tracer.LastResponse)) {
+        return $false # Throttling does return a response, if we don't have one, then throttling probably isn't the issue (though sometimes throttling just results in a timeout)
+    }
+
+    $lastResponse = $script:Tracer.LastResponse.Replace("<?xml version=`"1.0`" encoding=`"utf-8`"?>", "")
+    $lastResponse = "<?xml version=`"1.0`" encoding=`"utf-8`"?>$lastResponse"
+    $responseXml = [xml]$lastResponse
+
+    if ($responseXml.Trace.Envelope.Body.Fault.detail.MessageXml.Value.Name -eq "BackOffMilliseconds") {
+        # We are throttled, and the server has told us how long to back off for
+        Write-Host "Throttling detected, server requested back off for $($responseXml.Trace.Envelope.Body.Fault.detail.MessageXml.Value."#text") milliseconds" Yellow
+        Start-Sleep -Milliseconds $responseXml.Trace.Envelope.Body.Fault.detail.MessageXml.Value."#text"
+        Write-Host "Throttling budget should now be reset, resuming operations" Gray
+        return $true
+    }
+    return $false
+}
+
+function ThrottledFolderBind() {
+    param (
+        [Microsoft.Exchange.WebServices.Data.FolderId]$folderId,
+        $propSet = $null,
+        $exchangeService = $null
+    )
+
+    Write-Verbose "Calling $($MyInvocation.MyCommand)"
+    $folder = $null
+    if ($null -eq $exchangeService) {
+        $exchangeService = $Script:ewsService
+    }
+
+    try {
+        if ($null -eq $propSet) {
+            $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($exchangeService, $folderId)
+        } else {
+            $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($exchangeService, $folderId, $propSet)
+        }
+        if (!($null -eq $folder)) {
+            Write-Verbose "Successfully bound to folder $folderId"
+        }
+        return $folder
+    } catch {
+        Write-Error "Unable to bind to the $($folderId) folder."
+    }
+
+    if (Throttled) {
         try {
             if ($null -eq $propSet) {
                 $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($exchangeService, $folderId)
@@ -1325,219 +1753,207 @@ function Show-Disclaimer {
         } catch {
             Write-Error "Unable to bind to the $($folderId) folder."
         }
+    }
 
-        if (Throttled) {
+    # If we get to this point, we have been unable to bind to the folder
+    Write-HostLog"FAILED to bind to folder $folderId"
+    return $null
+}
+
+function GetFolderPath($Folder) {
+    # Return the full path for the given folder
+
+    # We cache our folder lookups for this script
+    if (!$script:folderCache) {
+        # Note that we can't use a PowerShell hash table to build a list of folder Ids, as the hash table is case-insensitive
+        # We use a .Net Dictionary object instead
+        $script:folderCache = New-Object 'System.Collections.Generic.Dictionary[System.String,System.Object]'
+    }
+
+    $propSet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly, [Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName, [Microsoft.Exchange.WebServices.Data.FolderSchema]::ParentFolderId)
+    $parentFolder = ThrottledFolderBind $Folder.Id $propSet $Folder.Service
+    $folderPath = $Folder.DisplayName
+    $parentFolderId = $Folder.Id
+    while ($parentFolder.ParentFolderId -ne $parentFolderId) {
+        if ($script:folderCache.ContainsKey($parentFolder.ParentFolderId.UniqueId)) {
             try {
-                if ($null -eq $propSet) {
-                    $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($exchangeService, $folderId)
-                } else {
-                    $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($exchangeService, $folderId, $propSet)
-                }
-                if (!($null -eq $folder)) {
-                    Write-Verbose "Successfully bound to folder $folderId"
-                }
-                return $folder
+                $parentFolder = $script:folderCache[$parentFolder.ParentFolderId.UniqueId]
             } catch {
-                Write-Error "Unable to bind to the $($folderId) folder."
+                Write-Error "Unable to find the parent folder."
             }
+        } else {
+            $parentFolder = ThrottledFolderBind $parentFolder.ParentFolderId $propSet $Folder.Service
+            $script:FolderCache.Add($parentFolder.Id.UniqueId, $parentFolder)
         }
+        $folderPath = $parentFolder.DisplayName + "\" + $folderPath
+        $parentFolderId = $parentFolder.Id
+    }
+    return $folderPath
+}
 
-        # If we get to this point, we have been unable to bind to the folder
-        Write-HostLog"FAILED to bind to folder $folderId"
-        return $null
+function GetWellKnownFolderPath($WellKnownFolder) {
+    if (!$script:wellKnownFolderCache) {
+        $script:wellKnownFolderCache = @{}
     }
 
-    function GetFolderPath($Folder) {
-        # Return the full path for the given folder
-
-        # We cache our folder lookups for this script
-        if (!$script:folderCache) {
-            # Note that we can't use a PowerShell hash table to build a list of folder Ids, as the hash table is case-insensitive
-            # We use a .Net Dictionary object instead
-            $script:folderCache = New-Object 'System.Collections.Generic.Dictionary[System.String,System.Object]'
-        }
-
-        $propSet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly, [Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName, [Microsoft.Exchange.WebServices.Data.FolderSchema]::ParentFolderId)
-        $parentFolder = ThrottledFolderBind $Folder.Id $propSet $Folder.Service
-        $folderPath = $Folder.DisplayName
-        $parentFolderId = $Folder.Id
-        while ($parentFolder.ParentFolderId -ne $parentFolderId) {
-            if ($script:folderCache.ContainsKey($parentFolder.ParentFolderId.UniqueId)) {
-                try {
-                    $parentFolder = $script:folderCache[$parentFolder.ParentFolderId.UniqueId]
-                } catch {
-                    Write-Error "Unable to find the parent folder."
-                }
-            } else {
-                $parentFolder = ThrottledFolderBind $parentFolder.ParentFolderId $propSet $Folder.Service
-                $script:FolderCache.Add($parentFolder.Id.UniqueId, $parentFolder)
-            }
-            $folderPath = $parentFolder.DisplayName + "\" + $folderPath
-            $parentFolderId = $parentFolder.Id
-        }
-        return $folderPath
+    if ($script:wellKnownFolderCache.ContainsKey($WellKnownFolder)) {
+        return $script:wellKnownFolderCache[$WellKnownFolder]
     }
 
-    function GetWellKnownFolderPath($WellKnownFolder) {
-        if (!$script:wellKnownFolderCache) {
-            $script:wellKnownFolderCache = @{}
-        }
-
-        if ($script:wellKnownFolderCache.ContainsKey($WellKnownFolder)) {
-            return $script:wellKnownFolderCache[$WellKnownFolder]
-        }
-
-        $folder = $null
-        $folderPath = $null
-        $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($Script:ewsService, $WellKnownFolder)
-        if ($folder) {
-            $folderPath = GetFolderPath($folder)
-            #LogVerbose "GetWellKnownFolderPath: Path for $($WellKnownFolder): $folderPath"
-        }
-        $script:wellKnownFolderCache.Add($WellKnownFolder, $folderPath)
-        return $folderPath
-    }
-
-    function IsFolderExcluded() {
-        # Return $true if folder is in the excluded list
-
-        param ($folderPath)
-
-        # To support localization, we need to handle WellKnownFolderName enumeration
-        # We do this by putting all our excluded folders into a hash table, and checking that we have the full path for any well known folders (which we retrieve from the mailbox)
-        if ($null -eq $script:excludedFolders) {
-            # Create and build our hash table
-            $script:excludedFolders = @{}
-
-            if ($ExcludeFolderList) {
-                #LogVerbose "Building folder exclusion list"#: $($ExcludeFolderList -join ',')"
-                foreach ($excludedFolder in $ExcludeFolderList) {
-                    $excludedFolder = $excludedFolder.ToLower()
-                    $wkfStart = $excludedFolder.IndexOf("wellknownfoldername")
-                    #LogVerbose "Excluded folder: $excludedFolder"
-                    if ($wkfStart -ge 0) {
-                        # Replace the well known folder name with its full path
-                        $wkfEnd = $excludedFolder.IndexOf("\", $wkfStart)-1
-                        if ($wkfEnd -lt 0) { $wkfEnd = $excludedFolder.Length }
-                        $wkf = $null
-                        $wkf = $excludedFolder.SubString($wkfStart+20, $wkfEnd - $wkfStart - 19)
-
-                        $wellKnownFolder = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::$wkf
-                        $wellKnownFolderPath = GetWellKnownFolderPath($wellKnownFolder)
-
-                        $excludedFolder = $excludedFolder.Substring(0, $wkfStart) + $wellKnownFolderPath + $excludedFolder.Substring($wkfEnd+1)
-                        #LogVerbose "Path of excluded folder: $excludedFolder"
-                    }
-                    $script:excludedFolders.Add($excludedFolder, $null)
-                }
-            }
-        }
-
-        return $script:excludedFolders.ContainsKey($folderPath.ToLower())
-    }
-
-    function SearchFolder( $FolderId ) {
-        # Bind to the folder and show which one we are processing
-        $folder = $null
-        CheckTokenExpiry -Environment $Environment -Token ([ref]$Script:EWSToken) -EWSService ([ref]$Script:ewsService) -ApplicationInfo $Script:applicationInfo -EWSOnlineURL $Script:ewsOnlineURL -EWSOnlineScope $Script:ewsOnlineScope -AzureADEndpoint $azureADEndpoint
-        $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($Script:ewsService, $FolderId)
-
-        if ($null -eq $folder) { return }
-
+    $folder = $null
+    $folderPath = $null
+    $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($Script:ewsService, $WellKnownFolder)
+    if ($folder) {
         $folderPath = GetFolderPath($folder)
+        #LogVerbose "GetWellKnownFolderPath: Path for $($WellKnownFolder): $folderPath"
+    }
+    $script:wellKnownFolderCache.Add($WellKnownFolder, $folderPath)
+    return $folderPath
+}
 
-        if (IsFolderExcluded($folderPath)) {
-            return
-        }
+function IsFolderExcluded() {
+    # Return $true if folder is in the excluded list
 
-        InitLists
+    param ($folderPath)
 
-        Write-Host "Searching the $($folderPath) for items." -ForegroundColor Gray
+    # To support localization, we need to handle WellKnownFolderName enumeration
+    # We do this by putting all our excluded folders into a hash table, and checking that we have the full path for any well known folders (which we retrieve from the mailbox)
+    if ($null -eq $script:excludedFolders) {
+        # Create and build our hash table
+        $script:excludedFolders = @{}
 
-        # Search the folder for any matching items
-        $pageSize = 100 # We will get details for up to 100 items at a time
-        $moreItems = $true
+        if ($ExcludeFolderList) {
+            #LogVerbose "Building folder exclusion list"#: $($ExcludeFolderList -join ',')"
+            foreach ($excludedFolder in $ExcludeFolderList) {
+                $excludedFolder = $excludedFolder.ToLower()
+                $wkfStart = $excludedFolder.IndexOf("wellknownfoldername")
+                #LogVerbose "Excluded folder: $excludedFolder"
+                if ($wkfStart -ge 0) {
+                    # Replace the well known folder name with its full path
+                    $wkfEnd = $excludedFolder.IndexOf("\", $wkfStart)-1
+                    if ($wkfEnd -lt 0) { $wkfEnd = $excludedFolder.Length }
+                    $wkf = $null
+                    $wkf = $excludedFolder.SubString($wkfStart+20, $wkfEnd - $wkfStart - 19)
 
-        # Configure ItemView
-        $view = New-Object Microsoft.Exchange.WebServices.Data.ItemView($pageSize, $offset, [Microsoft.Exchange.WebServices.Data.OffsetBasePoint]::Beginning)
-        $view.PropertySet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly,
-            [Microsoft.Exchange.WebServices.Data.ItemSchema]::Subject,
-            [Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::Sender)
-        $view.Offset = 0
-        $view.Traversal = [Microsoft.Exchange.WebServices.Data.ItemTraversal]::Shallow
+                    $wellKnownFolder = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::$wkf
+                    $wellKnownFolderPath = GetWellKnownFolderPath($wellKnownFolder)
 
-        # Configure the search filter using the provided criteria
-        $filters = @()
-
-        if (![String]::IsNullOrEmpty($MessageClass)) {
-            $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.ItemSchema]::ItemClass, $MessageClass)
-        }
-
-        if (![String]::IsNullOrEmpty($Subject)) {
-            $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+ContainsSubstring([Microsoft.Exchange.WebServices.Data.ItemSchema]::Subject, $Subject)
-        }
-
-        if (![String]::IsNullOrEmpty($Sender)) {
-            $senderEmailAddress = New-Object Microsoft.Exchange.WebServices.Data.EmailAddress($Sender)
-            $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::Sender, $senderEmailAddress)
-        }
-
-        if (![String]::IsNullOrEmpty($MessageId)) {
-            $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::InternetMessageId, $MessageId)
-        }
-
-        if (![string]::IsNullOrEmpty($MessageBody)) {
-            $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+ContainsSubstring([Microsoft.Exchange.WebServices.Data.ItemSchema]::Body, $MessageBody)
-        }
-
-        # Add filter(s) for creation time
-        if ( $CreatedAfter ) {
-            $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsGreaterThanOrEqualTo([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTimeCreated, $CreatedAfter)
-        }
-        if ( $CreatedBefore ) {
-            $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsLessThanOrEqualTo([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTimeCreated, $CreatedBefore)
-        }
-
-        # Create the search filter
-        $searchFilter = New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+SearchFilterCollection([Microsoft.Exchange.WebServices.Data.LogicalOperator]::And)
-        foreach ($filter in $filters) {
-            #LogVerbose([string]::Format("Adding search filter: {0}.", $filter.Value))
-            $searchFilter.Add($filter)
-        }
-
-        # Perform the search and display the results
-        while ($moreItems) {
-            CheckTokenExpiry -Environment $Environment -Token ([ref]$Script:EWSToken) -EWSService ([ref]$Script:ewsService) -ApplicationInfo $Script:applicationInfo -EWSOnlineURL $Script:ewsOnlineURL -EWSOnlineScope $Script:ewsOnlineScope -AzureADEndpoint $azureADEndpoint
-            if($null -notlike $searchFilter) {
-                $results = $Script:ewsService.FindItems( $FolderId, $searchFilter, $view )
-            }
-            else {
-                $results = $Script:ewsService.FindItems( $FolderId, $view )
-            }
-            
-            if ($results.Count -gt 0) {
-                foreach ($item in $results.Items) {
-                    ProcessItem $item
+                    $excludedFolder = $excludedFolder.Substring(0, $wkfStart) + $wellKnownFolderPath + $excludedFolder.Substring($wkfEnd+1)
+                    #LogVerbose "Path of excluded folder: $excludedFolder"
                 }
+                $script:excludedFolders.Add($excludedFolder, $null)
             }
+        }
+    }
 
-            $moreItems = $results.MoreAvailable
-            $view.Offset += $pageSize
+    return $script:excludedFolders.ContainsKey($folderPath.ToLower())
+}
+
+function SearchFolder( $FolderId ) {
+    # Bind to the folder and show which one we are processing
+    $folder = $null
+    if($null -notlike $Script:Token) {
+        CheckTokenExpiry -Environment $Environment -Token ([ref]$Script:Token) -EWSService ([ref]$Script:ewsService) -ApplicationInfo $Script:applicationInfo -EWSOnlineURL $Script:ewsOnlineURL -EWSOnlineScope $Script:ewsOnlineScope -AzureADEndpoint $azureADEndpoint
+    }
+    $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($Script:ewsService, $FolderId)
+
+    if ($null -eq $folder) { return }
+
+    $folderPath = GetFolderPath($folder)
+
+    if (IsFolderExcluded($folderPath)) {
+        return
+    }
+
+    InitLists
+
+    Write-Host "Searching the $($folderPath) for items." -ForegroundColor Gray
+
+    # Search the folder for any matching items
+    $pageSize = 100 # We will get details for up to 100 items at a time
+    $moreItems = $true
+
+    # Configure ItemView
+    $view = New-Object Microsoft.Exchange.WebServices.Data.ItemView($pageSize, $offset, [Microsoft.Exchange.WebServices.Data.OffsetBasePoint]::Beginning)
+    $view.PropertySet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly,
+        [Microsoft.Exchange.WebServices.Data.ItemSchema]::Subject,
+        [Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::Sender)
+    $view.Offset = 0
+    $view.Traversal = [Microsoft.Exchange.WebServices.Data.ItemTraversal]::Shallow
+
+    # Configure the search filter using the provided criteria
+    $filters = @()
+
+    if (![String]::IsNullOrEmpty($MessageClass)) {
+        $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.ItemSchema]::ItemClass, $MessageClass)
+    }
+
+    if (![String]::IsNullOrEmpty($Subject)) {
+        $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+ContainsSubstring([Microsoft.Exchange.WebServices.Data.ItemSchema]::Subject, $Subject)
+    }
+
+    if (![String]::IsNullOrEmpty($Sender)) {
+        $senderEmailAddress = New-Object Microsoft.Exchange.WebServices.Data.EmailAddress($Sender)
+        $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::Sender, $senderEmailAddress)
+    }
+
+    if (![String]::IsNullOrEmpty($MessageId)) {
+        $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo([Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::InternetMessageId, $MessageId)
+    }
+
+    if (![string]::IsNullOrEmpty($MessageBody)) {
+        $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+ContainsSubstring([Microsoft.Exchange.WebServices.Data.ItemSchema]::Body, $MessageBody)
+    }
+
+    # Add filter(s) for creation time
+    if ( $CreatedAfter ) {
+        $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsGreaterThanOrEqualTo([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTimeCreated, $CreatedAfter)
+    }
+    if ( $CreatedBefore ) {
+        $filters += New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsLessThanOrEqualTo([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTimeCreated, $CreatedBefore)
+    }
+
+    # Create the search filter
+    $searchFilter = New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+SearchFilterCollection([Microsoft.Exchange.WebServices.Data.LogicalOperator]::And)
+    foreach ($filter in $filters) {
+        #LogVerbose([string]::Format("Adding search filter: {0}.", $filter.Value))
+        $searchFilter.Add($filter)
+    }
+
+    # Perform the search and display the results
+    while ($moreItems) {
+        if($null -notlike $Script:Token) {
+            CheckTokenExpiry -Environment $Environment -Token ([ref]$Script:Token) -EWSService ([ref]$Script:ewsService) -ApplicationInfo $Script:applicationInfo -EWSOnlineURL $Script:ewsOnlineURL -EWSOnlineScope $Script:ewsOnlineScope -AzureADEndpoint $azureADEndpoint
+        }
+        if($null -notlike $searchFilter) {
+            $results = $Script:ewsService.FindItems( $FolderId, $searchFilter, $view )
+        }
+        else {
+            $results = $Script:ewsService.FindItems( $FolderId, $view )
+        }
+        
+        if ($results.Count -gt 0) {
+            foreach ($item in $results.Items) {
+                ProcessItem $item
+            }
         }
 
-        # Now search subfolders
-        if ($ProcessSubfolders) {
-            $view = New-Object Microsoft.Exchange.WebServices.Data.FolderView(500)
-            $view.PropertySet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly, [Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName)
-            foreach ($subFolder in $folder.FindFolders($view)) {
-                SearchFolder $subFolder.Id $folderPath
-            }
+        $moreItems = $results.MoreAvailable
+        $view.Offset += $pageSize
+    }
+
+    # Now search subfolders
+    if ($ProcessSubfolders) {
+        $view = New-Object Microsoft.Exchange.WebServices.Data.FolderView(500)
+        $view.PropertySet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly, [Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName)
+        foreach ($subFolder in $folder.FindFolders($view)) {
+            SearchFolder $subFolder.Id $folderPath
         }
     }
 }
+}
 process {}
 end {
-    # The following is the main script
     $Date = [DateTime]::Now
     $Script:StartTime = '{0:MM/dd/yyyy HH:mm:ss}' -f $Date
     $ResultsFile = "$OutputPath\$Mailbox-SearchResults-$('{0:MMddyyyyHHmms}' -f $Date).csv"
@@ -1553,7 +1969,7 @@ end {
     # Process as single mailbox
     $loggerParams = @{
         LogDirectory             = $OutputPath
-        LogName                  = "EwsSearchAndDelete-$((Get-Date).ToString("yyyyMMddhhmmss"))-Debug"
+        LogName                  = "EwsSearchMailbox-$((Get-Date).ToString("yyyyMMddhhmmss"))-Debug"
         AppendDateTimeToFileName = $false
         ErrorAction              = "SilentlyContinue"
     }
@@ -1567,10 +1983,46 @@ end {
     $cloudService = Get-CloudServiceEndpoint $AzureEnvironment
 
     # Define the endpoints that we need for the various calls to the Azure AD Graph API and EWS
-    $Script:ewsOnlineURL = "$($cloudService.ExchangeOnlineEndpoint)/EWS/Exchange.asmx"
     $Script:ewsOnlineScope = "$($cloudService.ExchangeOnlineEndpoint)/.default"
     $autoDSecureName = $cloudService.AutoDiscoverSecureName
     $azureADEndpoint = $cloudService.AzureADEndpoint
+
+    $Script:applicationInfo = @{
+        "TenantID" = $OAuthTenantId
+        "ClientID" = $OAuthClientId
+    }
+    #Verify EWS URL
+    if($Environment -eq "Onprem") {
+        if([string]::IsNullOrEmpty($EwsUrl)) {
+            Write-Warning "The Exchange Web Services URL must be provided for on-premises mailboxes."
+            exit
+        }
+        else{
+            if(-not($EwsUrl.EndsWith("EWS/Exchange.asmx"))) {
+                if(-not($EwsUrl.EndsWith("/"))) {
+                    $EwsUrl = "$($EwsUrl)/"
+                }
+            }
+            $Script:EwsEndpoint = "$($EwsUrl)EWS/Exchange.asmx"
+        }
+    }
+    else {
+        $Script:EwsEndpoint = "$($cloudService.ExchangeOnlineEndpoint)/EWS/Exchange.asmx"
+    }
+
+    #Get OAuth token for authentication
+    if(-not([string]::IsNullOrEmpty($OAuthClientId))){
+        Get-OAuthToken -AppScope $Scope -Api EWS
+    }
+    else {
+        if($Environment -eq "Online") {
+            Write-Warning "OAuth parameters are required for Exchange Online mailboxes."
+            exit
+        }
+        elseif($null -like $credential) {
+            $credential = Get-Credential -Message "Credentials to access mailbox using EWS"
+        }
+    }
 
     # Perform the search
     SearchMailbox
